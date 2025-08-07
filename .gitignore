@@ -176,3 +176,6 @@ cython_debug/
 
 
 finetuned_weights/
+overall_eval_MAYO
+overall_eval_MAYO_bbox
+overall_eval_whole_bbox_entireImageSet
