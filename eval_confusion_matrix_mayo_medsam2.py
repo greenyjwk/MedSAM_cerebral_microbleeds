@@ -89,9 +89,7 @@ def inference2(medsam_model, image_path, device):
         bbox_tensor = torch.tensor([bbox_tensor[0], bbox_tensor[1], bbox_tensor[2], bbox_tensor[3]], device = 'cuda:0', dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             image_embedding = medsam_model.image_encoder(img_1024_tensor)  # (1, 256, 64, 64)
-
         medsam_seg = inference3(medsam_model, image_embedding, bbox_tensor, H, W)
-
         return medsam_seg
         
     except Exception as e:
@@ -105,7 +103,7 @@ def load_medsam_model(checkpoint_path, device='cuda:0'):
         from train_one_gpu import MedSAM
         
         # Load base SAM model
-        sam_checkpoint = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250805-1445/medsam_model_best.pth"
+        sam_checkpoint = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250806-0753/medsam_model_best.pth"
         sam_model = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
         medsam_model = MedSAM(
             image_encoder=sam_model.image_encoder,
@@ -145,9 +143,12 @@ def yolo_gt_seg_pred_overlap_check(gt_path, pred_mask):
                     continue
                 gt_box_list.append([float(x) for x in parts[1:]])  # YOLO format
     
-    if pred_mask is None:
-        FALSE_NEGATIVE += len(gt_box_list)
-        return
+    print()
+    print("pred_mask", pred_mask)
+    print()
+    # if pred_mask == 1:
+    #     FALSE_NEGATIVE += len(gt_box_list)
+    #     return
 
     width = pred_mask.shape[0]
     num_features = pred_mask.max()
