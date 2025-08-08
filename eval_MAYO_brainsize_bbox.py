@@ -113,10 +113,7 @@ def load_medsam_model(checkpoint_path, device='cuda:0'):
         return None
 
 
-def get_bounding_box(mask_tensor):
-    print(mask_tensor.shape)
-    # sys.exit()
-
+def get_bounding_box(mask_tensor):    
     mask_tensor = torch.squeeze(mask_tensor)
     mask_tensor = mask_tensor.sum(dim=0)
     mask_tensor = (mask_tensor > 0).int()
@@ -248,9 +245,7 @@ for img_path in tqdm(image_paths, desc="Processing images"):
     try:
         Image.fromarray((pred_mask * 255).astype(np.uint8)).save(out_mask_path)
         processed_count += 1
-        print(f"✅ Processed {img_name} - bbox: {bbox}")
     except Exception as e:
-        print(f"Error saving predicted mask for {img_name}: {e}")
         skipped_count += 1
 
 # === ✅ FINAL REPORT ===

@@ -1,14 +1,17 @@
 import os
 import torch
 import numpy as np
-from PIL import Image
 from scipy.ndimage import label
-from skimage import transform
+from segment_anything import sam_model_registry
+from skimage import io, transform
+from PIL import Image
+import torch.nn.functional as F
+join = os.path.join
 
 TRUE_POSITVE = 0
 FALSE_NEGATIVE = 0
 FALSE_POSITIVE = 0
-SEGMENTATION_THRESHOLD = 1.0
+SEGMENTATION_THRESHOLD = 0.9
 
 # Set GPU device
 gpu = 2
@@ -16,13 +19,17 @@ os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
 torch.cuda.set_device(0)
 
 def get_bounding_box(mask_tensor):
-    print(mask_tensor.shape)
-
     mask_tensor = torch.squeeze(mask_tensor)
     mask_tensor = mask_tensor.sum(dim=0)
     mask_tensor = (mask_tensor > 0).int()
     nonzero = torch.nonzero(mask_tensor, as_tuple=False)
 
+    # Check if any non-zero pixels were found
+    if nonzero.size(0) == 0:
+        # If no non-zero pixels, return full image bounds
+        height, width = mask_tensor.shape
+        return [0, 0, width, height]
+    
     h_top = torch.min(nonzero[:,0]).item()
     h_bottom = torch.max(nonzero[:,0]).item()
     w_left = torch.min(nonzero[:,1]).item()
@@ -30,46 +37,69 @@ def get_bounding_box(mask_tensor):
     return [w_left, h_top, w_right, h_bottom]
 
 
-def inference_medsam(model, image_path, device):
-    try:
-        image = Image.open(image_path).convert('RGB')
-        image_np = np.array(image)
-        
-        # Resize image to 1024x1024 (MedSAM input size)
-        image_1024 = transform.resize(
-            image_np, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True
+@torch.no_grad()
+def inference3(medsam_model, img_embed, box_1024, H, W):
+    box_torch = torch.as_tensor(box_1024, dtype=torch.float, device=img_embed.device)
+    if len(box_torch.shape) == 2:
+        box_torch = box_torch[:, None, :]  # (B, 1, 4)
+
+    sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
+        points=None,
+        boxes=box_torch,
+        masks=None,
+    )
+    low_res_logits, _ = medsam_model.mask_decoder(
+        image_embeddings=img_embed,  # (B, 256, 64, 64)
+        image_pe=medsam_model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
+        sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
+        dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
+        multimask_output=False,
+    )
+
+    low_res_pred = torch.sigmoid(low_res_logits)  # (1, 1, 256, 256)
+    low_res_pred = F.interpolate(
+        low_res_pred,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )  # (1, 1, gt.shape)
+    low_res_pred = low_res_pred.squeeze().cpu().numpy()  # (256, 256)
+    medsam_seg = (low_res_pred > SEGMENTATION_THRESHOLD).astype(np.uint8)
+    # medsam_seg = (low_res_pred >= 1.0).astype(np.uint8)
+    return medsam_seg
+
+def inference2(medsam_model, image_path, device):
+    try:                
+        img_np = io.imread(image_path)
+        if len(img_np.shape) == 2:  # Converting 3 channels if it is grayscale
+            img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
+        else:
+            img_3c = img_np
+        H, W, _ = img_3c.shape
+
+        img_1024 = transform.resize(    # it performs bicubic interpolation
+            img_3c, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True
         ).astype(np.uint8)
-        
-        # Convert to tensor (H,W,C) -> (C,H,W) and normalize
-        image_tensor = torch.tensor(image_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
-        image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
-        
+        img_1024 = (img_1024 - img_1024.min()) / np.clip(
+            img_1024.max() - img_1024.min(), a_min=1e-8, a_max=None
+        )  # normalize to [0, 1], (H, W, 3)
+
+        # convert the shape to (3, H, W)
+        img_1024_tensor = (
+            torch.tensor(img_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
+        )
+
         # Tight brain size prompt bounding box
-        bbox_tensor = get_bounding_box(image_tensor)
+        bbox_tensor = get_bounding_box(img_1024_tensor)
         bbox_tensor = torch.tensor([bbox_tensor[0], bbox_tensor[1], bbox_tensor[2], bbox_tensor[3]], device = 'cuda:0', dtype=torch.float32).unsqueeze(0)
-
         with torch.no_grad():
-            pred_mask = model(image_tensor, bbox_tensor)
-            pred_mask = torch.sigmoid(pred_mask)
-            pred_mask = pred_mask.cpu().numpy().squeeze()
-
-        # Convert to binary mask and resize back to original size
-        pred_mask_binary = (pred_mask > SEGMENTATION_THRESHOLD).astype(np.uint8)
-        pred_mask_resized = transform.resize(
-            pred_mask_binary, image_np.shape[:2], order=0, preserve_range=True, anti_aliasing=False
-        ).astype(np.uint8)
-        
-        return pred_mask_resized > 0
+            image_embedding = medsam_model.image_encoder(img_1024_tensor)  # (1, 256, 64, 64)
+        medsam_seg = inference3(medsam_model, image_embedding, bbox_tensor, H, W)
+        return medsam_seg
         
     except Exception as e:
         print(f"❌ Inference error: {e}")
         return None
-
-def extract_bbox(mask):
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return None
-    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
 def load_medsam_model(checkpoint_path, device='cuda:0'):
     """Load the fine-tuned MedSAM model"""
@@ -78,7 +108,7 @@ def load_medsam_model(checkpoint_path, device='cuda:0'):
         from train_one_gpu import MedSAM
         
         # Load base SAM model
-        sam_checkpoint = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250805-1445/medsam_model_best.pth"
+        sam_checkpoint = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250806-0753/medsam_model_best.pth"
         sam_model = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
         medsam_model = MedSAM(
             image_encoder=sam_model.image_encoder,
@@ -98,7 +128,7 @@ def load_medsam_model(checkpoint_path, device='cuda:0'):
 
 def inference(file_path, checkpoint_path, device):
     medsam_model = load_medsam_model(checkpoint_path, device)    
-    pred_masks = inference_medsam(medsam_model, file_path, device='cuda:0')
+    pred_masks = inference2(medsam_model, file_path, device='cuda:0')
     pred_mask, num_clusters = label(pred_masks)
     return pred_mask, num_clusters
 
@@ -117,8 +147,14 @@ def yolo_gt_seg_pred_overlap_check(gt_path, pred_mask):
                 if len(parts) < 5:
                     continue
                 gt_box_list.append([float(x) for x in parts[1:]])  # YOLO format
+        
+    # Check if pred_mask is valid
+    if not isinstance(pred_mask, np.ndarray) or len(pred_mask.shape) < 2:
+        print("Warning: pred_mask is not a valid 2D array, skipping...")
+        # Count all ground truth boxes as false negatives since prediction failed
+        FALSE_NEGATIVE += len(gt_box_list)
+        return
 
-    print(pred_mask)
     width = pred_mask.shape[0]
     num_features = pred_mask.max()
     matched_preds = set()
@@ -153,22 +189,25 @@ def yolo_gt_seg_pred_overlap_check(gt_path, pred_mask):
     FALSE_POSITIVE += (num_features - len(matched_preds))
 
 def main():
-    img_root_path = "/media/Datacenter_storage/Ji/valdo_dataset/valdo_t2s_cmbOnly/images/val"
-    gt_root_path = "/media/Datacenter_storage/Ji/valdo_dataset/valdo_t2s_cmbOnly/labels/val"
+    img_root_path = "/media/Datacenter_storage/PublicDatasets/cerebral_microbleeds_MAYO/mayo_t2s_png/images/test"
+    gt_root_path = "/media/Datacenter_storage/PublicDatasets/cerebral_microbleeds_MAYO/mayo_t2s_png/labels/test"
     checkpoint_path = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250806-0753/medsam_model_best.pth"
-
+    # out_mask_path = "/media/Datacenter_storage/Ji/MedSAM/overall_eval_MAYO_brain_bbox"
+    out_mask_path = "/media/Datacenter_storage/Ji/MedSAM/TEMP"
     cnt = 0
     for img_path in os.listdir(img_root_path):
         img_full_path = os.path.join(img_root_path, img_path)
         gt_path = img_path.replace("png", "txt")
         full_gt_path = os.path.join(gt_root_path, gt_path)
         print(img_full_path)
-        pred_mask, num_clusters = inference(img_full_path, checkpoint_path, device='cuda:0')
+
+        pred_mask, _ = inference(img_full_path, checkpoint_path, device='cuda:0')
         yolo_gt_seg_pred_overlap_check(full_gt_path, pred_mask)
+        # save_mask(pred_mask, out_mask_path)
 
         cnt += 1
-        if cnt % 2  == 0:
         # if cnt % 50  == 0:
+        if cnt % 2  == 0:
             print("TRUE_POSTIVE", TRUE_POSITVE)
             print("FALSE_NEGATIVE", FALSE_NEGATIVE)
             print("FALSE_POSITIVE", FALSE_POSITIVE)
