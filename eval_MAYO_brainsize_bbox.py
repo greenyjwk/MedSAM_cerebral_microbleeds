@@ -91,7 +91,7 @@ def load_medsam_model(checkpoint_path, device='cuda:0'):
         from train_one_gpu import MedSAM
         
         # Load base SAM model
-        sam_checkpoint = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250805-1445/medsam_model_best.pth"
+        sam_checkpoint = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250806-0753/medsam_model_best.pth"
         sam_model = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
         # sam_model = sam_model_registry["vit_b"]()
         medsam_model = MedSAM(
@@ -112,6 +112,24 @@ def load_medsam_model(checkpoint_path, device='cuda:0'):
         print(f"❌ Error loading model: {e}")
         return None
 
+
+def get_bounding_box(mask_tensor):
+    print(mask_tensor.shape)
+    # sys.exit()
+
+    mask_tensor = torch.squeeze(mask_tensor)
+    mask_tensor = mask_tensor.sum(dim=0)
+    mask_tensor = (mask_tensor > 0).int()
+
+    nonzero = torch.nonzero(mask_tensor, as_tuple=False)
+
+    h_top = torch.min(nonzero[:,0]).item()
+    h_bottom = torch.max(nonzero[:,0]).item()
+    w_left = torch.min(nonzero[:,1]).item()
+    w_right = torch.max(nonzero[:,1]).item()
+    return [w_left, h_top, w_right, h_bottom]
+
+
 def inference_medsam(model, image_path, bbox, device='cuda:0'):
     """Run inference with MedSAM model"""
     try:
@@ -128,21 +146,26 @@ def inference_medsam(model, image_path, bbox, device='cuda:0'):
         image_tensor = torch.tensor(image_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
         image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
         
-        # Scale bbox coordinates to 1024x1024
-        h_scale = 1024 / image_np.shape[0]
-        w_scale = 1024 / image_np.shape[1]
+        # # Scale bbox coordinates to 1024x1024
+        # h_scale = 1024 / image_np.shape[0]
+        # w_scale = 1024 / image_np.shape[1]
         
-        scaled_bbox = [
-            int(bbox[0] * w_scale),  # x_min
-            int(bbox[1] * h_scale),  # y_min  
-            int(bbox[2] * w_scale),  # x_max
-            int(bbox[3] * h_scale)   # y_max
-        ]
+        # scaled_bbox = [
+        #     int(bbox[0] * w_scale),  # x_min
+        #     int(bbox[1] * h_scale),  # y_min  
+        #     int(bbox[2] * w_scale),  # x_max
+        #     int(bbox[3] * h_scale)   # y_max
+        # ]
         
         # bbox_tensor = torch.tensor(scaled_bbox).float().unsqueeze(0).to(device)
-        bbox_tensor = torch.tensor([0, 0, 1024, 1024], device='cuda:0', dtype=torch.float32).unsqueeze(0)
+        # bbox_tensor = torch.tensor([0, 0, 1024, 1024], device='cuda:0', dtype=torch.float32).unsqueeze(0)
+      
+        bbox_tensor = get_bounding_box(image_tensor)
+        bbox_tensor = torch.tensor([bbox_tensor[0], bbox_tensor[1], bbox_tensor[2], bbox_tensor[3]], device = 'cuda:0', dtype=torch.float32).unsqueeze(0)
+        print(bbox)
+        print()
+        # sys.exit()
 
-        
         # Run inference
         with torch.no_grad():
             pred_mask = model(image_tensor, bbox_tensor)
@@ -164,7 +187,7 @@ def inference_medsam(model, image_path, bbox, device='cuda:0'):
 # === 🔧 PATHS ===
 image_dir = "/media/Datacenter_storage/PublicDatasets/cerebral_microbleeds_MAYO/mayo_t2s_png/images/test"
 yolo_dir = "/media/Datacenter_storage/PublicDatasets/cerebral_microbleeds_MAYO/mayo_t2s_png/labels/test"  # Path to YOLO txt files
-checkpoint_path = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250805-1445/medsam_model_best.pth"
+checkpoint_path = "/media/Datacenter_storage/Ji/MedSAM/finetuned_weights/MedSAM-ViT-B-20250806-0753/medsam_model_best.pth"
 output_dir = "/media/Datacenter_storage/Ji/MedSAM/TEMP"
 os.makedirs(output_dir, exist_ok=True)
 
@@ -209,10 +232,10 @@ for img_path in tqdm(image_paths, desc="Processing images"):
     
     # Load YOLO bounding box
     bbox = load_yolo_bbox(yolo_path, img_width, img_height)
-    if bbox is None:
-        print(f"Warning: Could not load YOLO bbox for {img_name}")
-        skipped_count += 1
-        continue
+    # if bbox is None:
+    #     print(f"Warning: Could not load YOLO bbox for {img_name}")
+    #     skipped_count += 1
+    #     continue
     
     # Run MedSAM inference
     pred_mask = inference_medsam(medsam_model, img_path, bbox, device)
